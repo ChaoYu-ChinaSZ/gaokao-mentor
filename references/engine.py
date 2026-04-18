@@ -35,6 +35,9 @@ class State(Enum):
     CLARITY_CHECK = "CLARITY_CHECK"
     OUTPUT = "OUTPUT"
     END = "END"
+    FEEDBACK_RATING = "FEEDBACK_RATING"    # V2.0新增：满意度评分
+    FEEDBACK_DETAIL = "FEEDBACK_DETAIL"    # V2.0新增：深度反馈
+    FEEDBACK_SAVED = "FEEDBACK_SAVED"       # V2.0新增：反馈已保存
 
 
 # ═══════════════════════════════════════════════════════════
@@ -289,6 +292,11 @@ class CandidateProfile:
     clarity_level: str = ""
     recommended_majors: list = field(default_factory=list)
     conversation_history: list = field(default_factory=list)
+    # 反馈（V2.0新增）
+    feedback_rating: int = 0          # 1/2/3（有帮助/一般/没用）
+    feedback_match: str = ""          # 推荐符合度：A/B/C/D
+    feedback_valuable: str = ""       # 最价值环节：A/B/C/D
+    feedback_free: str = ""          # 自由文字反馈
 
     def save(self) -> str:
         path = os.path.join(PROFILE_DIR, "%s.json" % self.student_id)
@@ -333,6 +341,9 @@ class MentorEngine:
             State.CLARITY_CHECK: self._handle_clarity_check,
             State.OUTPUT: self._handle_output,
             State.END: self._handle_end,
+            State.FEEDBACK_RATING: self._handle_feedback_rating,
+            State.FEEDBACK_DETAIL: self._handle_feedback_detail,
+            State.FEEDBACK_SAVED: self._handle_feedback_saved,
         }
         return handlers[state]()
 
@@ -495,11 +506,51 @@ class MentorEngine:
             "有需要随时回来继续探索，祝你找到自己的方向！"
         )
 
+    # ─── 反馈收集（V2.0新增）────────────────────────────────
+
+    def _handle_feedback_rating(self) -> str:
+        self.profile.conversation_history.append(
+            {"state": "FEEDBACK_RATING", "user": ""}
+        )
+        return (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "  反馈（选填，30秒完成）\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "这次对话，你感觉：\n\n"
+            "① 有帮助  ② 一般  ③ 没用\n\n"
+            "（直接回复数字 1、2 或 3 即可）"
+        )
+
+    def _handle_feedback_detail(self) -> str:
+        return (
+            "\n你愿意花2分钟填写详细反馈吗？帮助我们优化这个工具。\n\n"
+            "回复\"详细反馈\"开始，或直接说\"不用了\"关闭对话。"
+        )
+
+    def _handle_feedback_saved(self) -> str:
+        self.profile.save()
+        return (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "反馈已收到，感谢你的帮助！\n"
+            "你的反馈会让这个工具变得更好。\n\n"
+            "已保存你的探索记录，有需要随时回来继续。\n"
+            "祝你找到自己的方向！"
+        )
+
     # ─── 用户输入处理 ─────────────────────────────────────
 
     def process_input(self, user_input: str) -> str:
         state = self.profile.current_state
         text = user_input.strip()
+
+        # 随时拦截"反馈"关键词（任意状态都可触发）
+        if "反馈" in text or "意见" in text or "建议" in text:
+            if state not in [State.FEEDBACK_RATING, State.FEEDBACK_DETAIL]:
+                self.profile.conversation_history.append(
+                    {"state": state.value, "user": text, "triggered": "feedback"}
+                )
+                return self._do_transition(State.FEEDBACK_RATING)
+
         self.profile.conversation_history.append({"state": state.value, "user": text})
 
         if state == State.START:
@@ -532,7 +583,63 @@ class MentorEngine:
         elif state == State.OUTPUT:
             return self._handle_output_choice(text)
 
-        return "（未知状态）"
+        elif state == State.FEEDBACK_RATING:
+            if text in ["1", "①"]:
+                self.profile.feedback_rating = 1
+            elif text in ["2", "②"]:
+                self.profile.feedback_rating = 2
+            elif text in ["3", "③"]:
+                self.profile.feedback_rating = 3
+            else:
+                self.profile.feedback_rating = 0
+            return self._do_transition(State.FEEDBACK_DETAIL)
+
+        elif state == State.FEEDBACK_DETAIL:
+            if "详细反馈" in text or "填写" in text or ("好" in text and len(text) < 5):
+                # 引导深度反馈问题
+                return (
+                    "\n谢谢你！请回答以下问题（直接回复字母即可）：\n\n"
+                    "1. 推荐的专业方向，你之前了解过吗？\n"
+                    "   A. 完全没听说过  B. 听说过但没深入  C. 了解过\n\n"
+                    "2. 推荐结果和你的自我认知相比：\n"
+                    "   A. 非常符合  B. 部分符合  C. 不太符合  D. 完全不符\n\n"
+                    "3. 对话中哪个部分最有价值？\n"
+                    "   A. Ikigai四问  B. 现实约束探测  C. RIASEC测评  D. 最终推荐\n\n"
+                    "请依次回复，如：A B C"
+                )
+            elif text and any(c in text.upper() for c in ["A", "B", "C", "D"]):
+                # 解析答案（格式如 "A B C" 或 "A,B,C" 或 "ABC"）
+                import re
+                letters = re.findall(r"[A-Da-d]", text.upper())
+                if len(letters) >= 1:
+                    self.profile.feedback_match = letters[0] if len(letters) > 0 else ""
+                    self.profile.feedback_valuable = letters[1] if len(letters) > 1 else ""
+                # 询问是否有文字补充
+                self.profile.conversation_history.append(
+                    {"state": "FEEDBACK_DETAIL", "answers": letters, "free_text": ""}
+                )
+                return (
+                    "\n收到！你觉得哪里可以更好？\n"
+                    "（直接打字发过来，或者回复\"没有\"跳过）"
+                )
+            elif text and "没有" not in text and "不用" not in text:
+                # 文字反馈
+                self.profile.feedback_free = text
+                self.profile.save()
+                return self._do_transition(State.FEEDBACK_SAVED)
+            else:
+                # 用户跳过，进入 END
+                self.profile.save()
+                return self._do_transition(State.END)
+
+        elif state == State.END:
+            # 随时可输入"反馈"触发反馈收集
+            if "反馈" in text or "意见" in text or "建议" in text:
+                return self._do_transition(State.FEEDBACK_RATING)
+            return "好的，已收到。有需要时随时回来继续探索。"
+
+        elif state == State.FEEDBACK_SAVED:
+            return "感谢你的反馈！有需要时随时回来继续探索。"
 
     def _handle_ikigai_answer(self, text: str) -> str:
         if not text or len(text) < 2:
@@ -607,7 +714,7 @@ class MentorEngine:
             self.profile.riasec_question_index = 0
             return "好的，我们换一个角度重新探索。"
         else:
-            return self._do_transition(State.END)
+            return self._do_transition(State.FEEDBACK_RATING)
 
     def _do_transition(self, next_state: State) -> str:
         self.profile.current_state = next_state
